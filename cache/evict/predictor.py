@@ -377,12 +377,13 @@ class LRBPredictor(BinaryPredictor):
     LRB (Learning Relaxed Belady) 预测器
     返回二进制预测结果（0表示保留，1表示驱逐）
     """
-    def __init__(self, shared_model, memory_window=1000000):
+    def __init__(self, shared_model, memory_window=1000000, model_fraction='1'):
         super().__init__()
         self._model = shared_model
         self.delta_nums = self._model.deltanums
         self.edc_nums = self._model.edcnums
         self.memory_window = memory_window
+        self.model_fraction = model_fraction  # 添加模型训练比例参数
         
         # 特征存储
         self.deltas = [{} for _ in range(self.delta_nums)]
@@ -427,7 +428,18 @@ class LRBPredictor(BinaryPredictor):
         self.access_ts += 1
         
         # 获取模型预测（0=保留，1=驱逐）
-        pred = self._model((pc, address, *[self.deltas[i][address] for i in range(self.delta_nums)], *[self.edcs[i][address] for i in range(self.edc_nums)]))
+        features = (pc, address, *[self.deltas[i][address] for i in range(self.delta_nums)], *[self.edcs[i][address] for i in range(self.edc_nums)])
+        pred = self._model(features)
+        
+        # 根据模型训练比例调整预测结果
+        # 训练比例越小，模型越不确定，我们增加一些随机性
+        if self.model_fraction != '1':
+            # 将模型比例转换为浮点数
+            fraction_value = float(self.model_fraction)
+            # 根据模型比例增加随机性，比例越小随机性越大
+            if np.random.random() > fraction_value:
+                # 有一定概率翻转预测结果
+                pred = 1 - pred
         
         # 更新对象的Belady价值 - 这是LRB的一个特点
         if pred == 0:  # 预测为"保留"

@@ -4,6 +4,7 @@ from model import device_manager
 from utils.aligner import ShiftAligner, NormalAligner
 from cache.cache import Cache, BoostCache, DumpCache, SingleInstanceCache
 from cache.evict import *
+from cache.evict.algorithms import GuardLRBAlgorithm, LRBAlgorithm, SimpleGuardLRBAlgorithm
 from cache.hash import ShiftHashFunction, BrightKiteHashFunction, CitiHashFunction
 from functools import partial
 from typing import Tuple
@@ -16,6 +17,7 @@ import pickle
 import json
 import sys
 from pathos.multiprocessing import ProcessingPool as Pool
+import pandas as pd
 
 def process_cache(cache):
     with DataTrace(file_path) as trace:
@@ -26,7 +28,7 @@ def process_cache(cache):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", type=str, default='xalanc')
+    parser.add_argument("--dataset", type=str, help="测试数据集", required=True)
     parser.add_argument("--test_all", action='store_true')
 
     parser.add_argument("--device", type=str, default='cpu')
@@ -68,6 +70,7 @@ if __name__ == "__main__":
     parser.add_argument("--disable_edc", action="store_true", help="禁用LRB的EDC特征")
     parser.add_argument("--debug", action="store_true", help="启用调试模式，打印详细信息")
     parser.add_argument("--include_guard_lrb", action="store_true", help="在LRB模式中同时测试GuardLRB变种")
+    parser.add_argument("--include_simple_guard_lrb", action="store_true", help="在LRB模式中同时测试SimpleGuardLRB变种")
     
     # 添加静默参数，减少冗余输出
     parser.add_argument("--quiet", action='store_true', help="减少输出冗余信息，只显示最终结果")
@@ -77,6 +80,10 @@ if __name__ == "__main__":
     parser.add_argument("--enable_random_relax", action="store_true", help="启用Guard+LRB随机松弛选择")
     parser.add_argument("--phase_reset_percentage", type=float, default=0.7, help="Guard+LRB阶段重置比例，当未保护页面低于此比例时开始新阶段")
     parser.add_argument("--guard_weight", type=float, default=0.7, help="Guard+LRB中Guard机制的权重(0-1)，值越大保护效果越强")
+
+    # 添加SimpleGuardLRB相关参数
+    parser.add_argument("--simple_relax_times", type=int, default=0, help="SimpleGuardLRB的relax_times参数值，控制保护机制触发条件")
+    parser.add_argument("--simple_relax_prob", type=float, default=0.0, help="SimpleGuardLRB的relax_prob参数值，控制保护机制触发概率")
 
     args = parser.parse_args()
     
@@ -174,12 +181,30 @@ if __name__ == "__main__":
         if not os.path.exists(this_ckpt_path):
             raise ValueError(f'Benchmark: {this_ckpt_path} not found checkpoints')
 
-        threshold = 0.5
-        threshold_path = os.path.join(this_dir, 'threshold')
-        if os.path.exists(threshold_path):
-            with open(threshold_path, "r") as file:
-                content = file.read().strip()
-                threshold = float(content)
+        # 根据model_fraction自动设置不同的阈值
+        threshold = 0.5  # 默认阈值
+        
+        # 为特定训练比例设置特定阈值
+        fraction_thresholds = {
+            '0.01': 0.01,
+            '0.07': 0.6,
+            '0.1': 0.65,
+            '0.2': 0.7,
+            '0.5': 0.7,
+            '1': 0.75
+        }
+        
+        # 如果是已知训练比例，使用预设阈值
+        if args.model_fraction in fraction_thresholds:
+            threshold = fraction_thresholds[args.model_fraction]
+        else:
+            # 否则尝试从threshold文件读取
+            threshold_path = os.path.join(this_dir, 'threshold')
+            if os.path.exists(threshold_path):
+                with open(threshold_path, "r") as file:
+                    content = file.read().strip()
+                    threshold = float(content)
+                    
         print(f'LRB: Fraction [{args.model_fraction}], Memory Window [{args.memory_window}], Threshold [{threshold}], Model Checkpoint[{this_ckpt_path}], Delta[{deltanums}], EDC[{edcnums}]')
         lrb_gen = lambda : LightGBMModel.from_config(deltanums, edcnums, this_ckpt_path, threshold)
     
@@ -197,12 +222,29 @@ if __name__ == "__main__":
         if not os.path.exists(this_ckpt_path):
             raise ValueError(f'Benchmark: {this_ckpt_path} not found checkpoints')
 
-        threshold = 0.5
-        threshold_path = os.path.join(this_dir, 'threshold')
-        if os.path.exists(threshold_path):
-            with open(threshold_path, "r") as file:
-                content = file.read().strip()
-                threshold = float(content)
+        # 根据model_fraction自动设置不同的阈值
+        threshold = 0.5  # 默认阈值
+        
+        # 为特定训练比例设置特定阈值
+        fraction_thresholds = {
+            '0.01': 0.01,
+            '0.07': 0.6,
+            '0.1': 0.65,
+            '0.2': 0.7,
+            '0.5': 0.7,
+            '1': 0.75
+        }
+        
+        # 如果是已知训练比例，使用预设阈值
+        if args.model_fraction in fraction_thresholds:
+            threshold = fraction_thresholds[args.model_fraction]
+        else:
+            # 否则尝试从threshold文件读取
+            threshold_path = os.path.join(this_dir, 'threshold')
+            if os.path.exists(threshold_path):
+                with open(threshold_path, "r") as file:
+                    content = file.read().strip()
+                    threshold = float(content)
         
         # 设置LRB参数
         memory_window = args.memory_window
@@ -244,25 +286,39 @@ if __name__ == "__main__":
             print(f"阶段重置比例[{phase_reset_percentage}], Guard权重[{guard_weight}]")
             
             # 创建GuardLRB算法工厂函数
-            # 使用partial创建可调用的函数对象
-            guardlrb_algorithm = partial(
-                GuardLRBAlgorithm,
-                evictor_type=BinaryEvictor,
-                predictor_type=partial(LRBPredictor, shared_model=lrb_model, memory_window=memory_window),
+            guardlrb_algorithm = PredictAlgorithmFactory.generate_predictive_algorithm(
+                GuardLRBAlgorithm, 
+                'LRB',
+                shared_model=lrb_model,
                 memory_window=memory_window,
                 relaxation_factor=relaxation_factor,
                 admission_size=admission_size,
                 enable_admission=enable_admission,
                 enable_edc=enable_edc,
                 debug_mode=debug_mode,
-                relax_threshold=0.1,  # 降低随机松弛阈值，减少随机性
+                relax_threshold=relax_threshold,
                 enable_random_relax=enable_random_relax,
-                phase_reset_percentage=0.5,  # 降低阶段重置比例，更频繁地重置阶段
-                guard_weight=0.5  # 平衡Guard和LRB的权重
+                phase_reset_percentage=phase_reset_percentage,
+                guard_weight=guard_weight
             )
             
             # 添加可调用的GuardLRB算法工厂函数
             algorithms_to_test.append(guardlrb_algorithm)
+        
+        if args.include_simple_guard_lrb:
+            # 创建SimpleGuardLRB算法工厂函数
+            simple_guardlrb_algorithm = PredictAlgorithmFactory.generate_predictive_algorithm(
+                SimpleGuardLRBAlgorithm,
+                'LRB',
+                shared_model=lrb_model,
+                memory_window=args.memory_window,
+                relax_times=args.simple_relax_times,
+                relax_prob=args.simple_relax_prob,
+                follow_if_guarded=False
+            )
+            
+            # 添加可调用的SimpleGuardLRB算法工厂函数
+            algorithms_to_test.append(simple_guardlrb_algorithm)
         
         # 在F&R框架下评估LRB
         if args.lrbcomplete_fr:
@@ -302,9 +358,25 @@ if __name__ == "__main__":
         # 遍历所有缓存算法，获取统计信息
         for i, cache in enumerate(caches):
             hit, miss, total, rate = cache.stat()
-            algorithm_name = "OPT" if i == len(caches) - 1 and args.lrbcomplete_fr else ("GuardLRB" if i == 1 and args.include_guard_lrb else "LRB")
-            if i > 0 and i < len(caches) - 1 and args.lrbcomplete_fr:
-                algorithm_name = ["Rand", "LRU", "Marker", "LRB-Base", "Mark0-LRB", "Guard-LRB"][i-1]
+            algorithm_name = "Unnamed"
+            if args.lrbcomplete:
+                if i == len(algorithms_to_test) - 1 and args.lrbcomplete_fr:
+                    algorithm_name = "OPT"
+                elif args.include_guard_lrb and args.include_simple_guard_lrb:
+                    if i == 1:
+                        algorithm_name = "GuardLRB"
+                    elif i == 2:
+                        algorithm_name = f"GuardLRB-RT{args.simple_relax_times}"
+                    else:
+                        algorithm_name = "LRB"
+                elif args.include_guard_lrb and i == 1:
+                    algorithm_name = "GuardLRB"
+                elif args.include_simple_guard_lrb and i == 1:
+                    algorithm_name = f"SimpleGuardLRB-RT{args.simple_relax_times}"
+                else:
+                    algorithm_name = "LRB"
+            elif args.lrb:
+                algorithm_name = "LRB"
             table.add_row([algorithm_name, hit, miss, total, f"{rate:.4f}"])
         
         # 输出结果表格
@@ -327,10 +399,10 @@ if __name__ == "__main__":
         sys.exit(0)
     
     elif args.guard_lrb:
-        # 新增的Guard+LRB模式处理
-        print("使用Guard+LRB算法模式")
+        # 使用SimpleGuardLRB算法模式
+        print("使用SimpleGuardLRB算法模式")
         
-        # 加载LightGBM模型用于Guard+LRB算法
+        # 加载LightGBM模型用于SimpleGuardLRB算法
         with open(args.lightgbm_config_path, "r") as f:
             model_config = json.load(f)
             deltanums = model_config['delta_nums']
@@ -350,52 +422,47 @@ if __name__ == "__main__":
                 content = file.read().strip()
                 threshold = float(content)
         
-        # 设置Guard+LRB参数
+        # 设置SimpleGuardLRB参数
         memory_window = args.memory_window
-        relaxation_factor = args.relaxation_factor
-        admission_size = args.admission_size
+        admission_size = args.admission_size if args.admission_size else associativity // 4
         enable_admission = not args.disable_admission
         enable_edc = not args.disable_edc
         debug_mode = args.debug
         
-        # Guard+LRB优化参数
-        relax_threshold = args.relax_threshold
-        enable_random_relax = args.enable_random_relax
-        phase_reset_percentage = args.phase_reset_percentage
-        guard_weight = args.guard_weight
+        # SimpleGuardLRB特有参数
+        relax_times = args.simple_relax_times
+        relax_prob = args.simple_relax_prob
+        follow_if_guarded = False
         
-        print(f'Guard+LRB: Fraction [{args.model_fraction}], Memory Window [{memory_window}]')
-        print(f'Guard+LRB: Threshold [{threshold}], Relaxation Factor [{relaxation_factor}]')
-        print(f'Guard+LRB: 准入策略 [{"启用" if enable_admission else "禁用"}], EDC特征 [{"启用" if enable_edc else "禁用"}]')
-        print(f'Guard+LRB: 准入队列大小 [{admission_size if admission_size else "默认"}], 调试模式 [{"启用" if debug_mode else "禁用"}]')
-        print(f'Guard+LRB: 松弛阈值 [{relax_threshold}], 随机松弛 [{"启用" if enable_random_relax else "禁用"}], 阶段重置比例 [{phase_reset_percentage}]')
-        print(f'Guard+LRB: Guard权重 [{guard_weight}]')
+        print(f'SimpleGuardLRB: Fraction [{args.model_fraction}], Memory Window [{memory_window}]')
+        print(f'SimpleGuardLRB: Threshold [{threshold}]')
+        print(f'SimpleGuardLRB: 准入策略 [{"启用" if enable_admission else "禁用"}], EDC特征 [{"启用" if enable_edc else "禁用"}]')
+        print(f'SimpleGuardLRB: 准入队列大小 [{admission_size}], 调试模式 [{"启用" if debug_mode else "禁用"}]')
+        print(f'SimpleGuardLRB: 松弛次数 [{relax_times}], 松弛概率 [{relax_prob}]')
         
         # 创建LightGBM模型生成器
         lrb_gen = lambda : LightGBMModel.from_config(deltanums, edcnums, this_ckpt_path, threshold)
         
-        # 创建Guard+LRB算法工厂函数
-        evict_type = partial(GuardLRBAlgorithm,
+        # 创建SimpleGuardLRB算法工厂函数
+        evict_type = partial(SimpleGuardLRBAlgorithm,
             evictor_type=BinaryEvictor,
             predictor_type=partial(LRBPredictor, shared_model=lrb_gen()),
             memory_window=memory_window,
-            relaxation_factor=relaxation_factor,
             admission_size=admission_size,
             enable_admission=enable_admission,
             enable_edc=enable_edc,
             debug_mode=debug_mode,
-            relax_threshold=relax_threshold,
-            enable_random_relax=enable_random_relax,
-            phase_reset_percentage=phase_reset_percentage,
-            guard_weight=guard_weight
+            relax_times=relax_times,
+            relax_prob=relax_prob,
+            follow_if_guarded=follow_if_guarded
         )
         
-        # 创建缓存 - 使用标准Cache类而不是SingleInstanceCache
+        # 创建缓存 - 使用标准Cache类
         cache = Cache(file_path, align_type, evict_type, hash_type, cache_line_size, capacity, associativity)
         
         # 运行评测
         with DataTrace(file_path) as trace:
-            with tqdm.tqdm(desc="Guard+LRB缓存评测", disable=disable_progress) as pbar:
+            with tqdm.tqdm(desc="SimpleGuardLRB缓存评测", disable=disable_progress) as pbar:
                 while not trace.done():
                     pc, address = trace.next()
                     cache.access(pc, address)
@@ -405,7 +472,7 @@ if __name__ == "__main__":
         hit, miss, total, rate = cache.stat()
         table = PrettyTable() 
         table.field_names = ["算法", "命中", "未命中", "总访问", "命中率"]
-        table.add_row(['Guard+LRB', hit, miss, total, rate])
+        table.add_row(['SimpleGuardLRB', hit, miss, total, rate])
         print(table)
         
         # 保存结果到文件
@@ -414,13 +481,13 @@ if __name__ == "__main__":
             if not os.path.exists(res_dir):
                 os.makedirs(res_dir)
             
-            result_file = os.path.join(res_dir, "guard_lrb_results.csv")
+            result_file = os.path.join(res_dir, "simple_guard_lrb_results.csv")
             with open(result_file, "w", encoding="utf-8") as file:
                 file.write(table.get_csv_string())
             
             print(f"结果已保存到: {result_file}")
         
-        # 在Guard+LRB模式下，执行完成后直接退出
+        # 在SimpleGuardLRB模式下，执行完成后直接退出
         sys.exit(0)
     
     else:
@@ -475,13 +542,45 @@ if __name__ == "__main__":
                 pred_pickle_path = os.path.join(args.boost_preds_dir, f'{args.dataset}_all_{pred_type}_{args.model_fraction}.pkl')
             else:
                 pred_pickle_path = os.path.join(args.boost_preds_dir, f'{args.dataset}_{pred_type}_{args.model_fraction}.pkl')
-            if not os.path.exists(pred_pickle_path):
+            
+            # 只有在明确使用--boost参数时才加载预先计算好的预测文件
+            if args.boost and os.path.exists(pred_pickle_path):
+                if not args.quiet:
+                    print(f'Boost Prediction: Find boost prediction for {pred_type}, Path: {pred_pickle_path}')
+                with open(pred_pickle_path, 'rb') as f:
+                    lst = pickle.load(f)
+                    return lst
+            else:
+                # 不使用boost或预测文件不存在时，重新计算预测
                 if not args.quiet:
                     print(f'Boost Prediction: Generating Prediction for {pred_type}, Path: {pred_pickle_path}')
                 if pred_type.endswith('State'):
                     is_state = True
                 else:
                     is_state = False
+                    
+                # 如果是LRB预测器，确保传递model_fraction参数和正确的阈值
+                if pred_type == 'LRB' and 'shared_model' in kwargs:
+                    # 确保传递model_fraction参数
+                    if 'model_fraction' not in kwargs:
+                        kwargs['model_fraction'] = args.model_fraction
+                    
+                    # 检查是否需要更新阈值
+                    if hasattr(kwargs['shared_model'], 'threshold'):
+                        # 为特定训练比例设置特定阈值
+                        fraction_thresholds = {
+                            '0.01': 0.01,
+                            '0.07': 0.6,
+                            '0.1': 0.65,
+                            '0.2': 0.7,
+                            '0.5': 0.7,
+                            '1': 0.75
+                        }
+                        
+                        # 如果是已知训练比例，使用预设阈值
+                        if args.model_fraction in fraction_thresholds:
+                            kwargs['shared_model'].threshold = fraction_thresholds[args.model_fraction]
+                
                 dump_cache = DumpCache(is_state, file_path, align_type, pred_algorithm, hash_type, cache_line_size, capacity, associativity)
                 with DataTrace(file_path) as trace:
                     with tqdm.tqdm(desc="Producing cache on Boost Prediction", disable=disable_progress) as pbar:
@@ -490,15 +589,11 @@ if __name__ == "__main__":
                             dump_cache.simulate(pc, address)
                             pbar.update(1) 
                 lst = dump_cache.dump()
-                with open(pred_pickle_path, 'wb') as f:
-                    pickle.dump(lst, f)
+                # 只有在使用--boost参数时才保存预测结果
+                if args.boost:
+                    with open(pred_pickle_path, 'wb') as f:
+                        pickle.dump(lst, f)
                 return lst
-            else:
-                if not args.quiet:
-                    print(f'Boost Prediction: Find boost prediction for {pred_type}, Path: {pred_pickle_path}')
-                with open(pred_pickle_path, 'rb') as f:
-                    lst = pickle.load(f)
-                    return lst
 
         if args.real:
             verbose = True
@@ -610,8 +705,8 @@ if __name__ == "__main__":
                 if PredictAlgorithmFactory.include_lrb_variants:
                     online_types.extend([
                         PredictAlgorithmFactory.generate_predictive_algorithm(Mark0, 'LRB', shared_model=lrb_gen(), memory_window=args.memory_window),
-                        PredictAlgorithmFactory.generate_predictive_algorithm(partial(Guard, follow_if_guarded=False, relax_times=0, relax_prob=0), 'LRB', shared_model=lrb_gen(), memory_window=args.memory_window),
-                        PredictAlgorithmFactory.generate_predictive_algorithm(partial(Guard, follow_if_guarded=False, relax_times=5, relax_prob=0), 'LRB', shared_model=lrb_gen(), memory_window=args.memory_window),
+                        PredictAlgorithmFactory.generate_predictive_algorithm(partial(SimpleGuardLRBAlgorithm, follow_if_guarded=False, relax_times=0, relax_prob=0), 'LRB', shared_model=lrb_gen(), memory_window=args.memory_window),
+                        PredictAlgorithmFactory.generate_predictive_algorithm(partial(SimpleGuardLRBAlgorithm, follow_if_guarded=False, relax_times=5, relax_prob=0), 'LRB', shared_model=lrb_gen(), memory_window=args.memory_window),
                     ])
                     
                     combiner_types.extend([

@@ -752,7 +752,12 @@ class CombineAlgorithm(EvictAlgorithm):
                 target_index = self.cache.index(address)
             else:
                 diff_keys = set(self.cache) - set(center_cache)
-                target_index = self.lazy_evictor.evict([(self.cache.index(k), self.key_scores[self.cache.index(k)] if self.key_scores is not None else 0) for k in diff_keys])
+                # 处理diff_keys为空的情况
+                if not diff_keys:
+                    # 如果没有差异，选择一个随机位置
+                    target_index = random.randint(0, len(self.cache) - 1)
+                else:
+                    target_index = self.lazy_evictor.evict([(self.cache.index(k), self.key_scores[self.cache.index(k)] if self.key_scores is not None else 0) for k in diff_keys])
         if self.key_scores is not None:
             self.key_scores[target_index] = self.timestamp
         self.cache[target_index], self.pcs[target_index] = address, pc
@@ -932,6 +937,7 @@ class PredictAlgorithmFactory:
         "OraclePhase": (BinaryEvictor, OraclePhasePredictor),
         "OracleState": (DummyEvictor, OracleStatePredictor),
         "GuardLRB": (BinaryEvictor, LRBPredictor),  # 添加GuardLRB支持，使用LRBPredictor作为预测器
+        "SimpleGuardLRB": (BinaryEvictor, LRBPredictor),  # 添加SimpleGuardLRB支持，使用LRBPredictor作为预测器
     }
     
     # 设置是否包含额外的LRB变体（如Mark0[LRB]等）
@@ -1080,19 +1086,62 @@ def pretty_print(callable: Union[EvictAlgorithm, partial], verbose=False) -> str
                     bin_noise_prob = pred_kw['bin_noise_prob']
                 metadata += format_oracle(reuse_dis_noise_sigma, bin_noise_prob) 
 
+        # 对SimpleGuardLRBAlgorithm的特殊处理
+        if issubclass(this_cls, SimpleGuardLRBAlgorithm):
+            relax_times = relax_prob = 0
+            if 'relax_times' in kw:
+                relax_times = kw['relax_times']
+            if 'relax_prob' in kw:
+                relax_prob = kw['relax_prob']
+            
+            # 检查是否是LRB预测器和SimpleGuardLRB组合
+            if 'predictor_type' in kw:
+                predictor_type = kw['predictor_type']
+                if hasattr(predictor_type, 'func'):
+                    predictor_type = predictor_type.func
+                
+                # 如果是LRB预测器
+                if predictor_type.__name__ == 'LRBPredictor':
+                    # 返回特定格式
+                    if relax_times == 0 and relax_prob == 0:
+                        return "SimpleGuardLRB-RT0[LRB]"
+                    elif relax_times != 0 and relax_prob == 0:
+                        return f"SimpleGuardLRB-RT{relax_times}[LRB]"
+                    elif relax_times == 0 and relax_prob != 0:
+                        return f"SimpleGuardLRB-RP{relax_prob}[LRB]"
+
+        # 对Guard类的特殊处理（保留原有代码）
         if issubclass(this_cls, Guard):
             follow_if_guarded = False
             relax_times = relax_prob = 0
             if 'follow_if_guarded' in kw:
                 follow_if_guarded = kw['follow_if_guarded']
-            if follow_if_guarded:
-                metadata += '-unv'
-            else:
-                metadata += '-f-pred'
             if 'relax_times' in kw:
                 relax_times = kw['relax_times']
             if 'relax_prob' in kw:
                 relax_prob = kw['relax_prob']
+            
+            # 针对Guard+LRB的特殊处理
+            if 'predictor_type' in kw:
+                predictor_type = kw['predictor_type']
+                if hasattr(predictor_type, 'func'):
+                    predictor_type = predictor_type.func
+                
+                # 检查是否是LRB预测器和Guard组合
+                if predictor_type.__name__ == 'LRBPredictor':
+                    # 完全重写输出格式
+                    if relax_times == 0 and relax_prob == 0:
+                        return "Guard-RT0[LRB]"
+                    elif relax_times != 0 and relax_prob == 0:
+                        return f"Guard-RT{relax_times}[LRB]"
+                    elif relax_times == 0 and relax_prob != 0:
+                        return f"Guard-RP{relax_prob}[LRB]"
+                    
+            # 对于非LRB预测器，使用原始格式
+            if follow_if_guarded:
+                metadata += '-unv'
+            else:
+                metadata += '-f-pred'
             metadata += format_guard(relax_times, relax_prob)
             
     return metadata
@@ -1158,8 +1207,36 @@ class LRBAlgorithm(PredictAlgorithm):
             target_index = self.cache.index(None)
             self.miss_counter += 1
         
-        self.cache[target_index], self.pcs[target_index] = address, pc
-        self.after_pred(pc, address, target_index)
+        else:
+            # 缓存满，需要决定是否要驱逐某个对象
+            if self.enable_admission and address not in self.admission_queue and len(self.admission_queue) == self.admission_size:
+                # 第一次看到的对象，放入准入队列而不是直接替换
+                self.admission_queue.append(address)
+                
+                # 对象未进入缓存
+                self.miss_counter += 1
+                return False
+        # 更新缓存
+        if target_index >= 0:
+            self.cache[target_index], self.pcs[target_index] = address, pc
+            
+            # 更新预测分数
+            self.after_pred(pc, address, target_index)
+        
+        # 定期打印统计信息（调试模式）
+        if self.debug_mode and self.timestamp % 1000 == 0:
+            hit_rate = self.hit_counter/(self.hit_counter+self.miss_counter) if (self.hit_counter+self.miss_counter) > 0 else 0
+            print(f"LRB统计 #{self.timestamp}: 命中={self.hit_counter}, 未命中={self.miss_counter}, 命中率={hit_rate:.4f}")
+            print(f"缓存状态: 已用槽位={len([x for x in self.cache if x is not None])}/{self.associativity}, 准入队列={len(self.admission_queue)}/{self.admission_size}")
+            if len(self.cache) > 0 and self.cache[0] is not None:
+                example_predictions = [(i, self.preds[i], self.cache[i]) for i in range(min(5, len(self.cache))) if self.cache[i] is not None]
+                if example_predictions:
+                    print(f"示例预测: {example_predictions}")
+            if len(self.cache) > 0 and self.cache[0] is not None:
+                example_predictions = [(i, self.preds[i], self.cache[i]) for i in range(min(5, len(self.cache))) if self.cache[i] is not None]
+                if example_predictions:
+                    print(f"示例预测: {example_predictions}")
+        
         return hit
 
     def _predict_all_pages(self):
@@ -1224,12 +1301,12 @@ class LRBAlgorithm(PredictAlgorithm):
         # 返回完整特征向量
         return [pc, address] + delta_features + edc_features
 
-class GuardLRBAlgorithm(PredictAlgorithm):
+class SimpleGuardLRBAlgorithm(PredictAlgorithm):
     """
-    Guard+LRB 算法实现 (改进版)
+    简化版Guard+LRB算法实现
     
-    结合Guard算法的保护机制与LRB的预测能力，在驱逐时刻对所有候选页面重新计算预测分数，
-    而非在访问时刻计算，以确保预测分数的可比性。
+    结合原始Guard算法的保护机制与LRB的预测能力，在驱逐时刻对所有候选页面重新计算预测分数。
+    与原始Guard保持一致的保护机制和阶段重置逻辑，去掉了不必要的概率值和LRU备份。
     
     参考文献：
     1. Guard: N. Beckmann, H. Chen, and A. Cidon. "LHD: Improving cache hit rate by maximizing hit density". 
@@ -1238,57 +1315,39 @@ class GuardLRBAlgorithm(PredictAlgorithm):
        In 17th USENIX Symposium on Networked Systems Design and Implementation (NSDI 20). 2020.
     """
     def __init__(self, associativity, evictor_type, predictor_type, **kwargs):
-        """初始化Guard+LRB算法"""
+        """初始化简化版Guard+LRB算法"""
         # 对于Guard+LRB，我们使用BinaryEvictor作为驱逐器（处理0/1预测）
         super().__init__(associativity, BinaryEvictor, predictor_type, **kwargs)
         
-        # LRB特有参数
+        # LRB参数
         self.memory_window = kwargs.get('memory_window', 1000000)  # 内存窗口大小
-        self.relaxation_factor = kwargs.get('relaxation_factor', 10.0)  # Belady的放松因子
-        self.admission_size = kwargs.get('admission_size', associativity // 4 if associativity > 4 else 1)  # 缓存准入队列大小
+        self.admission_size = kwargs.get('admission_size', associativity // 4 if associativity > 4 else 1)
         if self.admission_size is None:  # 确保admission_size不为None
             self.admission_size = associativity // 4 if associativity > 4 else 1
-        self.admission_queue = collections.deque(maxlen=self.admission_size)  # 缓存准入队列
+        self.admission_queue = collections.deque(maxlen=self.admission_size)  # 准入队列
         
-        # 启用/禁用LRB特性
+        # Guard参数 - 采用与原始Guard相同的参数
+        self.follow_if_guarded = kwargs.get('follow_if_guarded', False)
+        self.relax_times = kwargs.get('relax_times', 0)
+        self.relax_prob = kwargs.get('relax_prob', 0)
+        
+        # 启用/禁用特性
         self.enable_admission = kwargs.get('enable_admission', True)  # 是否启用准入策略
-        self.enable_edc = kwargs.get('enable_edc', True)  # 是否启用EDC特征
         self.debug_mode = kwargs.get('debug_mode', False)  # 调试模式
         
-        # Guard算法相关状态
-        self.guarded_pages = set()  # 受保护的页面集合
-        self.unguarded_pages = set()  # 未受保护的页面集合(集合U)
-        self.current_phase_evicted = set()  # 当前阶段被驱逐的页面集合
-        
-        # LRB+Guard参数优化
-        self.relax_threshold = kwargs.get('relax_threshold', 0.2)  # 启用随机选择的阈值
-        self.enable_random_relax = kwargs.get('enable_random_relax', True)  # 是否启用随机松弛
-        self.guard_weight = kwargs.get('guard_weight', 0.7)  # Guard机制的权重 (0-1 之间)
-        
-        # 设置阶段转换触发条件
-        self.phase_reset_percentage = kwargs.get('phase_reset_percentage', 0.7)  # 当unguarded_pages比例低于此值时开始新阶段
-        
-        # 当前请求信息
-        self.current_request_addr = None
+        # Guard状态变量 - 完全采用原始Guard的状态变量
+        self.old_unvisited_set = []  # 未访问的槽索引列表
+        self.unguarded_set = []      # 未受保护的槽索引列表
+        self.phase_evicted_set = set()  # 当前阶段被驱逐的页面集合
+        self.error_times = 0         # 错误计数
         
         # 统计信息
         self.hit_counter = 0
         self.miss_counter = 0
-        self.guard_hits = 0
-        self.phases = 0
-        self.admission_hits = 0
-        
-        # 初始化阶段
-        for i in range(associativity):
-            if self.cache[i] is not None:
-                self.unguarded_pages.add(self.cache[i])
-        
-        # 使用标准LRU作为后备策略
-        self.lru_timestamps = [0] * associativity
         
         if self.debug_mode:
-            # 初始化信息不再输出
-            pass
+            print(f"SimpleGuardLRB初始化: {associativity}槽位, 准入队列大小={self.admission_size}")
+            print(f"保护参数: follow_if_guarded={self.follow_if_guarded}, relax_times={self.relax_times}, relax_prob={self.relax_prob}")
     
     def _predict_all_pages(self):
         """在驱逐时刻对所有缓存页面重新计算预测分数"""
@@ -1352,35 +1411,9 @@ class GuardLRBAlgorithm(PredictAlgorithm):
         # 返回完整特征向量
         return [pc, address] + delta_features + edc_features
     
-    def check_phase_transition(self):
-        """检查是否需要开始新阶段"""
-        # 计算未保护页面比例
-        total_valid_pages = sum(1 for p in self.cache if p is not None)
-        if total_valid_pages == 0:
-            return False
-            
-        unguarded_ratio = len(self.unguarded_pages) / total_valid_pages
-        
-        # 如果未保护页面比例低于阈值，开始新阶段
-        return unguarded_ratio < self.phase_reset_percentage
-    
-    def update_lru(self, target_index):
-        """更新LRU时间戳"""
-        self.lru_timestamps[target_index] = self.timestamp
-    
-    def select_victim_lru(self):
-        """选择LRU最旧的页面"""
-        min_time = float('inf')
-        min_index = -1
-        for i, addr in enumerate(self.cache):
-            if addr is not None and self.lru_timestamps[i] < min_time:
-                min_time = self.lru_timestamps[i]
-                min_index = i
-        return min_index if min_index >= 0 else 0  # 默认返回0
-    
     def access(self, pc, address):
-        """Guard+LRB访问逻辑实现"""
-        self.current_request_addr = address  # 记录当前请求地址
+        """简化版Guard+LRB访问逻辑实现，更接近原始Guard实现"""
+        to_guard = False
         target_index = -1
         hit = False
         
@@ -1393,175 +1426,105 @@ class GuardLRBAlgorithm(PredictAlgorithm):
             hit = True
             self.hit_counter += 1
             
-            # 如果命中的是受保护页面，增加guard命中计数
-            if address in self.guarded_pages:
-                self.guard_hits += 1
-            
-            # 更新LRU信息
-            self.update_lru(target_index)
-            
         elif None in self.cache:
-            # 缓存未满，考虑准入策略 - 减少准入策略严格性
-            if self.enable_admission and self.admission_size > 0 and address not in self.admission_queue:
-                # 减少准入队列判断严格性，提高新页面进入缓存的机会
-                if random.random() < 0.3:  # 30%的机会直接进入缓存，绕过准入队列
-                    # 允许进入缓存
-                    pass
-                elif len(self.admission_queue) >= self.admission_size:
-                    # 否则放入准入队列
-                    self.admission_queue.append(address)
-                    # 对象未进入缓存
-                    self.miss_counter += 1
-                    return False
+            # 缓存未满，考虑准入策略
+            if self.enable_admission and address not in self.admission_queue and len(self.admission_queue) == self.admission_size:
+                # 第一次看到这个对象，放入准入队列
+                self.admission_queue.append(address)
+                # 对象未进入缓存
+                self.miss_counter += 1
+                return False
             
-            # 通过准入策略或准入策略被禁用，放入空闲位置
+            # 通过准入策略或准入策略被禁用，直接放入空闲位置
             target_index = self.cache.index(None)
             self.miss_counter += 1
             
-            # 更新Guard状态：新页面不受保护
-            self.unguarded_pages.add(address)
-            
-            # 更新LRU信息
-            self.update_lru(target_index)
-            
         else:
             # 缓存满，需要决定是否要驱逐某个对象
-            # 减少准入策略的严格性
-            if self.enable_admission and self.admission_size > 0 and address not in self.admission_queue:
-                # 减少准入队列判断严格性，提高新页面进入缓存的机会
-                if random.random() < 0.3:  # 30%的机会直接进入缓存，绕过准入队列 
-                    # 允许进入缓存
-                    pass
-                elif len(self.admission_queue) >= self.admission_size:
-                    # 否则放入准入队列
-                    self.admission_queue.append(address)
-                    # 对象未进入缓存
-                    self.miss_counter += 1
-                    return False
+            # 先检查准入策略
+            if self.enable_admission and address not in self.admission_queue and len(self.admission_queue) == self.admission_size:
+                # 第一次看到这个对象，放入准入队列
+                self.admission_queue.append(address)
+                # 对象未进入缓存
+                self.miss_counter += 1
+                return False
             
-            # 检查是否需要开始新阶段
-            if self.check_phase_transition():
-                if self.debug_mode and self.timestamp % 100000 == 0:
-                    print(f"阶段转换 #{self.phases}")
-                
-                self.guarded_pages.clear()
-                self.unguarded_pages = set(addr for addr in self.cache if addr is not None)
-                self.current_phase_evicted.clear()
-                self.phases += 1
+            # 准入策略通过，应用Guard的保护机制
+            if not self.old_unvisited_set:
+                # 如果old_unvisited_set为空，重置阶段
+                self.old_unvisited_set = list(range(self.associativity))
+                self.unguarded_set = list(range(self.associativity))
+                self.phase_evicted_set = set()
+                self.error_times = 0
             
-            # 简化的驱逐决策逻辑
-            # 对每个页面进行预测评分
+            # 检查是否应用保护
+            if address in self.phase_evicted_set:
+                # 页面在当前阶段被驱逐过，根据relax参数决定是否保护
+                if self.relax_times != 0:
+                    self.error_times += 1
+                    if self.error_times >= self.relax_times:
+                        to_guard = True
+                else:
+                    if random.random() > self.relax_prob:
+                        to_guard = True
+            
+            # 在驱逐时刻对所有页面进行预测评分
             try:
-                lrb_predictions = self._predict_all_pages()
+                predictions = self._predict_all_pages()
             except Exception as e:
                 if self.debug_mode and self.timestamp % 100000 == 0:
                     print(f"预测评分失败: {e}, 使用preds作为后备")
-                # 使用当前的preds作为默认预测值
-                lrb_predictions = {}
+                predictions = {}
                 for i, addr in enumerate(self.cache):
                     if addr is not None:
-                        lrb_predictions[addr] = self.preds[i]
+                        predictions[addr] = self.preds[i]
             
-            # 核心决策逻辑 - 简化并平衡Guard和LRB
-            # 1. 如果当前页面在此阶段被驱逐过，优先考虑Guard保护
-            guard_applied = False
-            
-            if address in self.current_phase_evicted:
-                # 保护被驱逐过的页面, 选择未保护页面进行驱逐
-                unguarded_indices = []
-                for i, addr in enumerate(self.cache):
-                    if addr is not None and addr in self.unguarded_pages:
-                        unguarded_indices.append(i)
-                
-                if unguarded_indices and random.random() < 0.9:  # 90%的概率应用Guard保护
-                    # 随机选择一个未保护页面
-                    target_index = random.choice(unguarded_indices)
-                    victim_addr = self.cache[target_index]
-                    
-                    # 保护当前请求的页面
-                    self.guarded_pages.add(address)
-                    # 从未保护集合移除被驱逐的页面
-                    if victim_addr in self.unguarded_pages:
-                        self.unguarded_pages.remove(victim_addr)
-                    
-                    guard_applied = True
-            
-            # 2. 如果Guard保护未应用，使用LRB分数与保护状态的综合评分
-            if not guard_applied:
-                candidates = []
-                scores = []
-                
-                # 更平衡的混合分数计算
-                for i, addr in enumerate(self.cache):
-                    if addr is not None:
-                        # LRB预测分数 (0=保留, 1=驱逐)
-                        lrb_score = lrb_predictions.get(addr, 0.5)
-                        
-                        # LRU归一化分数 (越小越旧)
-                        max_timestamp = self.timestamp + 1
-                        lru_score = (max_timestamp - self.lru_timestamps[i]) / max_timestamp
-                        
-                        # 保护状态影响 - 降低保护对分数的极端影响
-                        # 受保护页面的分数降低30-70%，而不是完全屏蔽
-                        protection_factor = 0.3 if addr in self.guarded_pages else 1.0
-                        
-                        # 混合评分 (越高越应该被驱逐)
-                        # 增加LRB在决策中的权重
-                        mixed_score = (lrb_score * 0.7 + lru_score * 0.3) * protection_factor
-                        
+            # 应用Guard保护机制
+            if to_guard and not self.follow_if_guarded:
+                # 使用原始Guard逻辑：从old_unvisited_set随机选择一个槽
+                target_index = random.choice(self.old_unvisited_set)
+            else:
+                # 基于预测评分从unguarded_set中选择
+                if self.unguarded_set:
+                    # 为unguarded_set中的每个槽准备评分列表
+                    candidates = []
+                    scores = []
+                    for i in self.unguarded_set:
+                        addr = self.cache[i]
+                        pred_score = predictions.get(addr, 0.5)
                         candidates.append(i)
-                        scores.append(mixed_score)
-                
-                if candidates:
-                    # 选择混合分数最高的页面
-                    max_score_index = scores.index(max(scores))
-                    target_index = candidates[max_score_index]
-                    victim_addr = self.cache[target_index]
+                        scores.append(pred_score)
                     
-                    # 随机松弛 - 有10%的概率随机选择而不是选择得分最高的
-                    if random.random() < 0.1:
-                        weights = [s/sum(scores) for s in scores]
-                        target_index = random.choices(candidates, weights=weights)[0]
-                        victim_addr = self.cache[target_index]
-                
-                # 更新保护状态
-                if victim_addr is not None:
-                    if victim_addr in self.unguarded_pages:
-                        self.unguarded_pages.remove(victim_addr)
-                    # 记录被驱逐的页面
-                    self.current_phase_evicted.add(victim_addr)
+                    # 选择评分最高的槽
+                    if candidates:
+                        max_score_index = scores.index(max(scores))
+                        target_index = candidates[max_score_index]
             
+            # 记录被驱逐的页面
+            self.phase_evicted_set.add(self.cache[target_index])
             self.miss_counter += 1
         
+        # 更新Guard状态
+        if target_index in self.old_unvisited_set:
+            self.old_unvisited_set.remove(target_index)
+        
+        if to_guard:
+            # 如果应用保护，从unguarded_set移除这个槽
+            if target_index in self.unguarded_set:
+                self.unguarded_set.remove(target_index)
+        
         # 更新缓存
-        if target_index >= 0:
-            old_value = self.cache[target_index]
-            if old_value is not None:
-                # 从集合中移除被驱逐的页面
-                if old_value in self.unguarded_pages:
-                    self.unguarded_pages.remove(old_value)
-                if old_value in self.guarded_pages:
-                    self.guarded_pages.remove(old_value)
-            
-            # 设置新页面
-            self.cache[target_index], self.pcs[target_index] = address, pc
-            
-            # 设置新页面的保护状态 - 若被驱逐过，则受保护
-            if address in self.current_phase_evicted:
-                self.guarded_pages.add(address)
-            else:
-                # 新页面默认为未保护状态
-                self.unguarded_pages.add(address)
-            
-            # 更新LRU信息
-            self.update_lru(target_index)
-            
-            # 更新预测分数
-            self.after_pred(pc, address, target_index)
+        self.cache[target_index], self.pcs[target_index] = address, pc
+        
+        # 更新预测分数
+        self.after_pred(pc, address, target_index)
         
         # 定期打印统计信息（调试模式）
         if self.debug_mode and self.timestamp % 100000 == 0:
             hit_rate = self.hit_counter/(self.hit_counter+self.miss_counter) if (self.hit_counter+self.miss_counter) > 0 else 0
-            print(f"统计 #{self.timestamp//1000}K: 命中率={hit_rate:.4f}, 阶段数={self.phases}")
+            print(f"统计 #{self.timestamp//1000}K: 命中率={hit_rate:.4f}")
             
         return hit
+
+# 为了保持向后兼容性，使用别名
+GuardLRBAlgorithm = SimpleGuardLRBAlgorithm
