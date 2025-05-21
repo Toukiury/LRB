@@ -752,7 +752,12 @@ class CombineAlgorithm(EvictAlgorithm):
                 target_index = self.cache.index(address)
             else:
                 diff_keys = set(self.cache) - set(center_cache)
-                target_index = self.lazy_evictor.evict([(self.cache.index(k), self.key_scores[self.cache.index(k)] if self.key_scores is not None else 0) for k in diff_keys])
+                # 处理diff_keys为空的情况
+                if not diff_keys:
+                    # 如果没有差异，选择一个随机位置
+                    target_index = random.randint(0, len(self.cache) - 1)
+                else:
+                    target_index = self.lazy_evictor.evict([(self.cache.index(k), self.key_scores[self.cache.index(k)] if self.key_scores is not None else 0) for k in diff_keys])
         if self.key_scores is not None:
             self.key_scores[target_index] = self.timestamp
         self.cache[target_index], self.pcs[target_index] = address, pc
@@ -931,6 +936,8 @@ class PredictAlgorithmFactory:
         "OracleBin": (BinaryEvictor, OracleBinaryPredictor),
         "OraclePhase": (BinaryEvictor, OraclePhasePredictor),
         "OracleState": (DummyEvictor, OracleStatePredictor),
+        "GuardLRB": (BinaryEvictor, LRBPredictor),  # 添加GuardLRB支持，使用LRBPredictor作为预测器
+        "SimpleGuardLRB": (BinaryEvictor, LRBPredictor),  # 添加SimpleGuardLRB支持，使用LRBPredictor作为预测器
     }
     
     # 设置是否包含额外的LRB变体（如Mark0[LRB]等）
@@ -1079,19 +1086,62 @@ def pretty_print(callable: Union[EvictAlgorithm, partial], verbose=False) -> str
                     bin_noise_prob = pred_kw['bin_noise_prob']
                 metadata += format_oracle(reuse_dis_noise_sigma, bin_noise_prob) 
 
+        # 对SimpleGuardLRBAlgorithm的特殊处理
+        if issubclass(this_cls, SimpleGuardLRBAlgorithm):
+            relax_times = relax_prob = 0
+            if 'relax_times' in kw:
+                relax_times = kw['relax_times']
+            if 'relax_prob' in kw:
+                relax_prob = kw['relax_prob']
+            
+            # 检查是否是LRB预测器和SimpleGuardLRB组合
+            if 'predictor_type' in kw:
+                predictor_type = kw['predictor_type']
+                if hasattr(predictor_type, 'func'):
+                    predictor_type = predictor_type.func
+                
+                # 如果是LRB预测器
+                if predictor_type.__name__ == 'LRBPredictor':
+                    # 返回特定格式
+                    if relax_times == 0 and relax_prob == 0:
+                        return "SimpleGuardLRB-RT0[LRB]"
+                    elif relax_times != 0 and relax_prob == 0:
+                        return f"SimpleGuardLRB-RT{relax_times}[LRB]"
+                    elif relax_times == 0 and relax_prob != 0:
+                        return f"SimpleGuardLRB-RP{relax_prob}[LRB]"
+
+        # 对Guard类的特殊处理（保留原有代码）
         if issubclass(this_cls, Guard):
             follow_if_guarded = False
             relax_times = relax_prob = 0
             if 'follow_if_guarded' in kw:
                 follow_if_guarded = kw['follow_if_guarded']
-            if follow_if_guarded:
-                metadata += '-unv'
-            else:
-                metadata += '-f-pred'
             if 'relax_times' in kw:
                 relax_times = kw['relax_times']
             if 'relax_prob' in kw:
                 relax_prob = kw['relax_prob']
+            
+            # 针对Guard+LRB的特殊处理
+            if 'predictor_type' in kw:
+                predictor_type = kw['predictor_type']
+                if hasattr(predictor_type, 'func'):
+                    predictor_type = predictor_type.func
+                
+                # 检查是否是LRB预测器和Guard组合
+                if predictor_type.__name__ == 'LRBPredictor':
+                    # 完全重写输出格式
+                    if relax_times == 0 and relax_prob == 0:
+                        return "Guard-RT0[LRB]"
+                    elif relax_times != 0 and relax_prob == 0:
+                        return f"Guard-RT{relax_times}[LRB]"
+                    elif relax_times == 0 and relax_prob != 0:
+                        return f"Guard-RP{relax_prob}[LRB]"
+                    
+            # 对于非LRB预测器，使用原始格式
+            if follow_if_guarded:
+                metadata += '-unv'
+            else:
+                metadata += '-f-pred'
             metadata += format_guard(relax_times, relax_prob)
             
     return metadata
@@ -1111,7 +1161,9 @@ class LRBAlgorithm(PredictAlgorithm):
         # LRB特有参数
         self.memory_window = kwargs.get('memory_window', 1000000)  # 内存窗口大小
         self.relaxation_factor = kwargs.get('relaxation_factor', 10.0)  # Belady的放松因子
-        self.admission_size = kwargs.get('admission_size', associativity // 4)  # 缓存准入队列大小
+        self.admission_size = kwargs.get('admission_size', associativity // 4 if associativity > 4 else 1)  # 缓存准入队列大小
+        if self.admission_size is None:  # 确保admission_size不为None
+            self.admission_size = associativity // 4 if associativity > 4 else 1
         self.admission_queue = collections.deque(maxlen=self.admission_size)  # 缓存准入队列
         
         # 启用/禁用LRB特性
@@ -1124,9 +1176,8 @@ class LRBAlgorithm(PredictAlgorithm):
         self.miss_counter = 0
         
         if self.debug_mode:
-            print(f"LRB初始化: 内存窗口大小={self.memory_window}, 放松因子={self.relaxation_factor}")
-            print(f"准入策略={'启用' if self.enable_admission else '禁用'}, EDC特征={'启用' if self.enable_edc else '禁用'}")
-            print(f"准入队列大小={self.admission_size}, 缓存容量={associativity}")
+            # 初始化信息不再输出
+            pass
     
     def access(self, pc, address):
         """LRB访问逻辑实现"""
@@ -1155,7 +1206,7 @@ class LRBAlgorithm(PredictAlgorithm):
             # 通过准入策略或准入策略被禁用，直接放入缓存
             target_index = self.cache.index(None)
             self.miss_counter += 1
-            
+        
         else:
             # 缓存满，需要决定是否要驱逐某个对象
             if self.enable_admission and address not in self.admission_queue and len(self.admission_queue) == self.admission_size:
@@ -1165,11 +1216,6 @@ class LRBAlgorithm(PredictAlgorithm):
                 # 对象未进入缓存
                 self.miss_counter += 1
                 return False
-            
-            # 使用BinaryEvictor基于预测结果选择驱逐对象
-            target_index = self.evictor.evict(list(enumerate(self.preds)))
-            self.miss_counter += 1
-        
         # 更新缓存
         if target_index >= 0:
             self.cache[target_index], self.pcs[target_index] = address, pc
@@ -1186,5 +1232,299 @@ class LRBAlgorithm(PredictAlgorithm):
                 example_predictions = [(i, self.preds[i], self.cache[i]) for i in range(min(5, len(self.cache))) if self.cache[i] is not None]
                 if example_predictions:
                     print(f"示例预测: {example_predictions}")
+            if len(self.cache) > 0 and self.cache[0] is not None:
+                example_predictions = [(i, self.preds[i], self.cache[i]) for i in range(min(5, len(self.cache))) if self.cache[i] is not None]
+                if example_predictions:
+                    print(f"示例预测: {example_predictions}")
         
         return hit
+
+    def _predict_all_pages(self):
+        """在驱逐时刻对所有缓存页面重新计算预测分数"""
+        predictions = {}
+        
+        # 遍历缓存中的所有页面
+        for i, entry in enumerate(zip(self.cache, self.pcs)):
+            if entry[0] is not None:  # 确保页面存在
+                address = entry[0]
+                features = self._extract_features((address, entry[1]))
+                
+                # 根据预测器类型选择预测方法
+                try:
+                    if hasattr(self.predictor, '_model'):
+                        # LRBPredictor使用_model方法
+                        predictions[address] = self.predictor._model(features)
+                    elif hasattr(self.predictor, 'predict'):
+                        # 其他预测器可能使用predict方法
+                        predictions[address] = self.predictor.predict(features)
+                    else:
+                        # 没有可用的预测方法，使用默认值
+                        predictions[address] = 0.5
+                except Exception as e:
+                    if self.debug_mode and self.timestamp % 100000 == 0:
+                        print(f"预测页面 {address} 失败: {e}")
+                    # 发生异常，使用默认值
+                    predictions[address] = 0.5
+        
+        return predictions
+    
+    def _extract_features(self, cache_entry):
+        """从缓存条目中提取LRB所需特征"""
+        address = cache_entry[0]
+        pc = cache_entry[1]
+        
+        # 如果使用的是LRBPredictor，直接使用它的特征提取能力
+        if hasattr(self.predictor, 'extract_features'):
+            return self.predictor.extract_features(self.timestamp, pc, address)
+        
+        # 否则尝试手动提取特征
+        predictor = self.predictor
+        delta_features = []
+        edc_features = []
+        
+        # 尝试提取delta特征
+        if hasattr(predictor, 'deltas'):
+            for i in range(getattr(predictor, 'delta_nums', 1)):
+                if address in predictor.deltas[i]:
+                    delta_features.append(predictor.deltas[i][address])
+                else:
+                    delta_features.append(np.inf)
+        
+        # 尝试提取EDC特征
+        if hasattr(predictor, 'edcs'):
+            for i in range(getattr(predictor, 'edc_nums', 1)):
+                if address in predictor.edcs[i]:
+                    edc_features.append(predictor.edcs[i][address])
+                else:
+                    edc_features.append(0)
+        
+        # 返回完整特征向量
+        return [pc, address] + delta_features + edc_features
+
+class SimpleGuardLRBAlgorithm(PredictAlgorithm):
+    """
+    简化版Guard+LRB算法实现
+    
+    结合原始Guard算法的保护机制与LRB的预测能力，在驱逐时刻对所有候选页面重新计算预测分数。
+    与原始Guard保持一致的保护机制和阶段重置逻辑，去掉了不必要的概率值和LRU备份。
+    
+    参考文献：
+    1. Guard: N. Beckmann, H. Chen, and A. Cidon. "LHD: Improving cache hit rate by maximizing hit density". 
+       In 15th USENIX Symposium on Networked Systems Design and Implementation (NSDI 18). 2018.
+    2. LRB: Z. Song, D. S. Berger, K. Li, and W. Lloyd. "Learning relaxed belady for content distribution network caching".
+       In 17th USENIX Symposium on Networked Systems Design and Implementation (NSDI 20). 2020.
+    """
+    def __init__(self, associativity, evictor_type, predictor_type, **kwargs):
+        """初始化简化版Guard+LRB算法"""
+        # 对于Guard+LRB，我们使用BinaryEvictor作为驱逐器（处理0/1预测）
+        super().__init__(associativity, BinaryEvictor, predictor_type, **kwargs)
+        
+        # LRB参数
+        self.memory_window = kwargs.get('memory_window', 1000000)  # 内存窗口大小
+        self.admission_size = kwargs.get('admission_size', associativity // 4 if associativity > 4 else 1)
+        if self.admission_size is None:  # 确保admission_size不为None
+            self.admission_size = associativity // 4 if associativity > 4 else 1
+        self.admission_queue = collections.deque(maxlen=self.admission_size)  # 准入队列
+        
+        # Guard参数 - 采用与原始Guard相同的参数
+        self.follow_if_guarded = kwargs.get('follow_if_guarded', False)
+        self.relax_times = kwargs.get('relax_times', 0)
+        self.relax_prob = kwargs.get('relax_prob', 0)
+        
+        # 启用/禁用特性
+        self.enable_admission = kwargs.get('enable_admission', True)  # 是否启用准入策略
+        self.debug_mode = kwargs.get('debug_mode', False)  # 调试模式
+        
+        # Guard状态变量 - 完全采用原始Guard的状态变量
+        self.old_unvisited_set = []  # 未访问的槽索引列表
+        self.unguarded_set = []      # 未受保护的槽索引列表
+        self.phase_evicted_set = set()  # 当前阶段被驱逐的页面集合
+        self.error_times = 0         # 错误计数
+        
+        # 统计信息
+        self.hit_counter = 0
+        self.miss_counter = 0
+        
+        if self.debug_mode:
+            print(f"SimpleGuardLRB初始化: {associativity}槽位, 准入队列大小={self.admission_size}")
+            print(f"保护参数: follow_if_guarded={self.follow_if_guarded}, relax_times={self.relax_times}, relax_prob={self.relax_prob}")
+    
+    def _predict_all_pages(self):
+        """在驱逐时刻对所有缓存页面重新计算预测分数"""
+        predictions = {}
+        
+        # 遍历缓存中的所有页面
+        for i, entry in enumerate(zip(self.cache, self.pcs)):
+            if entry[0] is not None:  # 确保页面存在
+                address = entry[0]
+                features = self._extract_features((address, entry[1]))
+                
+                # 根据预测器类型选择预测方法
+                try:
+                    if hasattr(self.predictor, '_model'):
+                        # LRBPredictor使用_model方法
+                        predictions[address] = self.predictor._model(features)
+                    elif hasattr(self.predictor, 'predict'):
+                        # 其他预测器可能使用predict方法
+                        predictions[address] = self.predictor.predict(features)
+                    else:
+                        # 没有可用的预测方法，使用默认值
+                        predictions[address] = 0.5
+                except Exception as e:
+                    if self.debug_mode and self.timestamp % 100000 == 0:
+                        print(f"预测页面 {address} 失败: {e}")
+                    # 发生异常，使用默认值
+                    predictions[address] = 0.5
+        
+        return predictions
+    
+    def _extract_features(self, cache_entry):
+        """从缓存条目中提取LRB所需特征"""
+        address = cache_entry[0]
+        pc = cache_entry[1]
+        
+        # 如果使用的是LRBPredictor，直接使用它的特征提取能力
+        if hasattr(self.predictor, 'extract_features'):
+            return self.predictor.extract_features(self.timestamp, pc, address)
+        
+        # 否则尝试手动提取特征
+        predictor = self.predictor
+        delta_features = []
+        edc_features = []
+        
+        # 尝试提取delta特征
+        if hasattr(predictor, 'deltas'):
+            for i in range(getattr(predictor, 'delta_nums', 1)):
+                if address in predictor.deltas[i]:
+                    delta_features.append(predictor.deltas[i][address])
+                else:
+                    delta_features.append(np.inf)
+        
+        # 尝试提取EDC特征
+        if hasattr(predictor, 'edcs'):
+            for i in range(getattr(predictor, 'edc_nums', 1)):
+                if address in predictor.edcs[i]:
+                    edc_features.append(predictor.edcs[i][address])
+                else:
+                    edc_features.append(0)
+        
+        # 返回完整特征向量
+        return [pc, address] + delta_features + edc_features
+    
+    def access(self, pc, address):
+        """简化版Guard+LRB访问逻辑实现，更接近原始Guard实现"""
+        to_guard = False
+        target_index = -1
+        hit = False
+        
+        # 刷新预测分数（仅用于更新特征）
+        self.before_pred(pc, address)
+        
+        if address in self.cache:
+            # 缓存命中
+            target_index = self.cache.index(address)
+            hit = True
+            self.hit_counter += 1
+            
+        elif None in self.cache:
+            # 缓存未满，考虑准入策略
+            if self.enable_admission and address not in self.admission_queue and len(self.admission_queue) == self.admission_size:
+                # 第一次看到这个对象，放入准入队列
+                self.admission_queue.append(address)
+                # 对象未进入缓存
+                self.miss_counter += 1
+                return False
+            
+            # 通过准入策略或准入策略被禁用，直接放入空闲位置
+            target_index = self.cache.index(None)
+            self.miss_counter += 1
+            
+        else:
+            # 缓存满，需要决定是否要驱逐某个对象
+            # 先检查准入策略
+            if self.enable_admission and address not in self.admission_queue and len(self.admission_queue) == self.admission_size:
+                # 第一次看到这个对象，放入准入队列
+                self.admission_queue.append(address)
+                # 对象未进入缓存
+                self.miss_counter += 1
+                return False
+            
+            # 准入策略通过，应用Guard的保护机制
+            if not self.old_unvisited_set:
+                # 如果old_unvisited_set为空，重置阶段
+                self.old_unvisited_set = list(range(self.associativity))
+                self.unguarded_set = list(range(self.associativity))
+                self.phase_evicted_set = set()
+                self.error_times = 0
+            
+            # 检查是否应用保护
+            if address in self.phase_evicted_set:
+                # 页面在当前阶段被驱逐过，根据relax参数决定是否保护
+                if self.relax_times != 0:
+                    self.error_times += 1
+                    if self.error_times >= self.relax_times:
+                        to_guard = True
+                else:
+                    if random.random() > self.relax_prob:
+                        to_guard = True
+            
+            # 在驱逐时刻对所有页面进行预测评分
+            try:
+                predictions = self._predict_all_pages()
+            except Exception as e:
+                if self.debug_mode and self.timestamp % 100000 == 0:
+                    print(f"预测评分失败: {e}, 使用preds作为后备")
+                predictions = {}
+                for i, addr in enumerate(self.cache):
+                    if addr is not None:
+                        predictions[addr] = self.preds[i]
+            
+            # 应用Guard保护机制
+            if to_guard and not self.follow_if_guarded:
+                # 使用原始Guard逻辑：从old_unvisited_set随机选择一个槽
+                target_index = random.choice(self.old_unvisited_set)
+            else:
+                # 基于预测评分从unguarded_set中选择
+                if self.unguarded_set:
+                    # 为unguarded_set中的每个槽准备评分列表
+                    candidates = []
+                    scores = []
+                    for i in self.unguarded_set:
+                        addr = self.cache[i]
+                        pred_score = predictions.get(addr, 0.5)
+                        candidates.append(i)
+                        scores.append(pred_score)
+                    
+                    # 选择评分最高的槽
+                    if candidates:
+                        max_score_index = scores.index(max(scores))
+                        target_index = candidates[max_score_index]
+            
+            # 记录被驱逐的页面
+            self.phase_evicted_set.add(self.cache[target_index])
+            self.miss_counter += 1
+        
+        # 更新Guard状态
+        if target_index in self.old_unvisited_set:
+            self.old_unvisited_set.remove(target_index)
+        
+        if to_guard:
+            # 如果应用保护，从unguarded_set移除这个槽
+            if target_index in self.unguarded_set:
+                self.unguarded_set.remove(target_index)
+        
+        # 更新缓存
+        self.cache[target_index], self.pcs[target_index] = address, pc
+        
+        # 更新预测分数
+        self.after_pred(pc, address, target_index)
+        
+        # 定期打印统计信息（调试模式）
+        if self.debug_mode and self.timestamp % 100000 == 0:
+            hit_rate = self.hit_counter/(self.hit_counter+self.miss_counter) if (self.hit_counter+self.miss_counter) > 0 else 0
+            print(f"统计 #{self.timestamp//1000}K: 命中率={hit_rate:.4f}")
+            
+        return hit
+
+# 为了保持向后兼容性，使用别名
+GuardLRBAlgorithm = SimpleGuardLRBAlgorithm

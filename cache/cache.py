@@ -181,3 +181,66 @@ class LightGBMTrainingCache(TrainingCache):
         bin_label = self.evict_algs[idx].preds[target_index]
         self.access_ts[idx] += 1
         return (pc, aligned_address, *[self.deltas[i][key] for i in range(self.delta_nums)], *[self.edcs[i][key] for i in range(self.edc_nums)], bin_label)
+
+class SingleInstanceCache(Cache):
+    """
+    一个特殊的缓存类，它使用单个算法实例而不是为每个缓存集合创建新的实例。
+    这对于复杂算法（如GuardLRB）特别有用，因为这些算法可能在初始化时有大量的输出或需要共享状态。
+    """
+    def __init__(self, trace_path, aligner_type, evict_instance, hash_type, cache_line_size, cache_capacity, associativity):
+        """
+        初始化SingleInstanceCache
+        
+        参数:
+        - trace_path: 跟踪文件路径
+        - aligner_type: 地址对齐器类型
+        - evict_instance: 已经初始化好的驱逐算法实例
+        - hash_type: 哈希函数类型
+        - cache_line_size: 缓存行大小
+        - cache_capacity: 缓存总容量
+        - associativity: 相联度
+        """
+        # 初始化基本属性
+        self.evict_algs = None
+        self.hits = 0
+        self.miss = 0
+        self.counts = 0
+        self._trace_path = trace_path
+        self._aligner = aligner_type(cache_line_size)
+
+        # 计算缓存参数
+        num_cache_lines = cache_capacity // cache_line_size
+        self.num_sets = num_sets = num_cache_lines // associativity
+        if (cache_capacity % cache_line_size != 0 or num_cache_lines % associativity != 0):
+            raise ValueError(
+                ("Cache capacity ({}) must be an even multiple of "
+                "cache_line_size ({}) and associativity ({})").format(
+                    cache_capacity, cache_line_size, associativity))
+        if num_sets == 0:
+            raise ValueError(
+                ("Cache capacity ({}) is not great enough for {} cache lines per set "
+                "and cache lines of size {}").format(cache_capacity, associativity, cache_line_size))
+        
+        # 初始化哈希函数
+        self.hash_func = hash_type(num_sets)
+        
+        # 设置算法实例 (只用一个实例)
+        self.evict_instance = evict_instance
+        self.evict_algs = [self.evict_instance]
+        
+        # 处理Oracle（如果需要）
+        if hasattr(self.evict_instance, 'oracle_access'):
+            self.__handle_oracle(trace_path)
+    
+    def access(self, pc, address):
+        """重写access方法，适应单实例模式"""
+        aligned_address = self._aligner.get_aligned_addr(address)
+        # 在单实例模式下，总是使用同一个算法实例
+        hit = self.evict_instance.access(pc, aligned_address)
+        
+        if hit:
+            self.hits += 1
+        else:
+            self.miss += 1
+        self.counts += 1
+        return hit
